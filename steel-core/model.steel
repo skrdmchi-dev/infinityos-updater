@@ -1,0 +1,117 @@
+// Catalogue and component schema validation, channel filtering, and search.
+
+fn is_valid_component_id(id) {
+    if id == null || len(id) < 2 || len(id) > 64 {
+        return false
+    }
+    let i = 0
+    while i < len(id) {
+        let c = char_code(slice(id, i, i + 1))
+        let ok_low = c >= 97 && c <= 122
+        let ok_dig = c >= 48 && c <= 57
+        let ok_sym = c == 45 || c == 95 || c == 46
+        if !ok_low && !ok_dig && !ok_sym {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn validate_catalogue_entry(id, entry) {
+    if !is_valid_component_id(id) {
+        return { "ok": false, "reason": "invalid component id: " + str(id) }
+    }
+    if !has_key(entry, "version") {
+        return { "ok": false, "reason": id + ": missing version" }
+    }
+    let v = parse_semver(entry["version"])
+    if !v["valid"] {
+        return { "ok": false, "reason": id + ": invalid semver: " + str(entry["version"]) }
+    }
+    if !has_key(entry, "install_path") {
+        return { "ok": false, "reason": id + ": missing install_path" }
+    }
+    let scope = "system"
+    if has_key(entry, "scope") && entry["scope"] != null && len(str(entry["scope"])) > 0 {
+        scope = entry["scope"]
+    }
+    let pchk = validate_install_path(entry["install_path"], scope)
+    if !pchk["ok"] {
+        return { "ok": false, "reason": id + ": " + pchk["reason"] }
+    }
+    if has_key(entry, "sha256") && entry["sha256"] != null && len(str(entry["sha256"])) > 0 {
+        if !validate_sha256(str(entry["sha256"])) {
+            return { "ok": false, "reason": id + ": invalid sha256 hex" }
+        }
+    }
+    return { "ok": true, "reason": "" }
+}
+
+fn validate_catalogue(catalogue) {
+    let ks = keys(catalogue)
+    let errors = []
+    let i = 0
+    while i < len(ks) {
+        let id = ks[i]
+        let chk = validate_catalogue_entry(id, catalogue[id])
+        if !chk["ok"] {
+            push(errors, chk["reason"])
+        }
+        i = i + 1
+    }
+    return {
+        "ok": len(errors) == 0,
+        "count": len(ks),
+        "errors": errors
+    }
+}
+
+fn matches_channel(entry, channel) {
+    if channel == null || len(channel) == 0 || channel == "all" {
+        return true
+    }
+    if !has_key(entry, "channel") || entry["channel"] == null || len(str(entry["channel"])) == 0 {
+        return channel == "stable"
+    }
+    let ec = entry["channel"]
+    if channel == "nightly" {
+        return true
+    }
+    if channel == "beta" {
+        return ec == "stable" || ec == "beta"
+    }
+    return ec == "stable"
+}
+
+fn search_catalogue(catalogue, query, channel) {
+    let q = lower(trim(query))
+    let ks = sort(keys(catalogue))
+    let matches = []
+    let i = 0
+    while i < len(ks) {
+        let id = ks[i]
+        let entry = catalogue[id]
+        if matches_channel(entry, channel) {
+            let desc = ""
+            if has_key(entry, "description") && entry["description"] != null {
+                desc = lower(str(entry["description"]))
+            }
+            let cat = ""
+            if has_key(entry, "category") && entry["category"] != null {
+                cat = lower(str(entry["category"]))
+            }
+            if len(q) == 0 || contains(lower(id), q) || contains(desc, q) || contains(cat, q) {
+                push(matches, {
+                    "id": id,
+                    "version": entry["version"],
+                    "scope": has_key(entry, "scope") ? entry["scope"] : "system",
+                    "description": has_key(entry, "description") ? entry["description"] : "",
+                    "category": has_key(entry, "category") ? entry["category"] : "general"
+                })
+            }
+        }
+        i = i + 1
+    }
+    return matches
+}
