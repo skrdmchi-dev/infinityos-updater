@@ -1,0 +1,139 @@
+// Security policy for install paths, archive entries (zip-slip), and privilege gates.
+
+fn is_protected_system_prefix(path) {
+    let blocked = [
+        "/etc", "/boot", "/proc", "/sys", "/dev",
+        "/bin", "/sbin", "/lib", "/lib64", "/root",
+        "/var/lib/dpkg", "/var/lib/apt", "/usr/bin/sudo"
+    ]
+    let i = 0
+    while i < len(blocked) {
+        let prefix = blocked[i]
+        if path == prefix || starts_with(path, prefix + "/") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn validate_install_path(path, scope) {
+    if path == null || len(path) == 0 {
+        return { "ok": false, "reason": "install path must not be empty" }
+    }
+    if contains(path, "//") {
+        return { "ok": false, "reason": "duplicate slash in install path" }
+    }
+    if contains(path, "\\") {
+        return { "ok": false, "reason": "backslash not allowed in unix install path" }
+    }
+    let segs = split(path, "/")
+    let i = 0
+    while i < len(segs) {
+        if segs[i] == ".." || segs[i] == "." {
+            return { "ok": false, "reason": "path traversal segment not allowed" }
+        }
+        i = i + 1
+    }
+    if is_protected_system_prefix(path) {
+        return { "ok": false, "reason": "protected system or dpkg directory" }
+    }
+    if scope == "system" {
+        if !starts_with(path, "/usr/share/") && !starts_with(path, "/opt/infinityos/") {
+            return { "ok": false, "reason": "system scope must target /usr/share/ or /opt/infinityos/" }
+        }
+        if len(segs) < 4 {
+            return { "ok": false, "reason": "system install path is too shallow" }
+        }
+        return { "ok": true, "reason": "" }
+    }
+    if scope == "user" {
+        if !starts_with(path, "~/.local/share/") && !starts_with(path, "/home/") {
+            return { "ok": false, "reason": "user scope must target ~/.local/share/ or /home/" }
+        }
+        return { "ok": true, "reason": "" }
+    }
+    return { "ok": false, "reason": "unknown install scope: " + str(scope) }
+}
+
+fn validate_archive_entry(entry_path) {
+    if entry_path == null || len(entry_path) == 0 {
+        return { "ok": false, "reason": "empty archive entry" }
+    }
+    if starts_with(entry_path, "/") {
+        return { "ok": false, "reason": "absolute path in archive: " + entry_path }
+    }
+    if contains(entry_path, "\\") {
+        return { "ok": false, "reason": "backslash in archive entry: " + entry_path }
+    }
+    let segs = split(entry_path, "/")
+    let i = 0
+    while i < len(segs) {
+        if segs[i] == ".." {
+            return { "ok": false, "reason": "zip-slip traversal in archive: " + entry_path }
+        }
+        i = i + 1
+    }
+    return { "ok": true, "reason": "" }
+}
+
+fn validate_archive_manifest(entries) {
+    let i = 0
+    while i < len(entries) {
+        let chk = validate_archive_entry(entries[i])
+        if !chk["ok"] {
+            return chk
+        }
+        i = i + 1
+    }
+    return { "ok": true, "reason": "" }
+}
+
+fn requires_privilege_escalation(scope) {
+    return scope == "system"
+}
+
+fn is_valid_hex_string(s, expected_len) {
+    if s == null || len(s) != expected_len {
+        return false
+    }
+    let low = lower(s)
+    let i = 0
+    while i < len(low) {
+        let ch = slice(low, i, i + 1)
+        let code = char_code(ch)
+        let is_digit = code >= 48 && code <= 57
+        let is_hex = code >= 97 && code <= 102
+        if !is_digit && !is_hex {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn validate_sha256(digest) {
+    return is_valid_hex_string(digest, 64)
+}
+
+fn validate_ed25519_sig(sig) {
+    return is_valid_hex_string(sig, 128)
+}
+
+fn verify_component_integrity(entry, computed_sha256, sig_verified) {
+    let expected = entry["sha256"]
+    if expected != null && len(str(expected)) > 0 {
+        if !validate_sha256(str(expected)) {
+            return { "ok": false, "reason": "malformed expected sha256 digest" }
+        }
+        if lower(str(computed_sha256)) != lower(str(expected)) {
+            return { "ok": false, "reason": "sha256 mismatch: expected " + str(expected) + ", got " + str(computed_sha256) }
+        }
+    }
+    if has_key(entry, "signature") && len(str(entry["signature"])) > 0 {
+        if !sig_verified {
+            return { "ok": false, "reason": "ed25519 signature verification failed" }
+        }
+    }
+    return { "ok": true, "reason": "" }
+}
