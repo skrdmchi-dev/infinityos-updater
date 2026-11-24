@@ -1,0 +1,254 @@
+// Desired-state reconciler: install, upgrade, downgrade, remove, and update checks.
+
+fn check_file_conflicts(ownership, component_id, files) {
+    if ownership == null || files == null {
+        return { "ok": true, "conflict": "" }
+    }
+    let i = 0
+    while i < len(files) {
+        let f = files[i]
+        if has_key(ownership, f) && ownership[f] != component_id {
+            return {
+                "ok": false,
+                "conflict": "file " + f + " is already owned by " + str(ownership[f])
+            }
+        }
+        i = i + 1
+    }
+    return { "ok": true, "conflict": "" }
+}
+
+fn plan_reconcile(installed, catalogue, targets) {
+    let resolved = resolve_install_order(catalogue, targets)
+    if !resolved["ok"] {
+        return {
+            "ok": false,
+            "actions": [],
+            "skipped": [],
+            "requires_root": false,
+            "error": resolved["error"]
+        }
+    }
+
+    let actions = []
+    let skipped = []
+    let needs_root = false
+    let order = resolved["order"]
+    let i = 0
+    while i < len(order) {
+        let id = order[i]
+        let entry = catalogue[id]
+        let scope = "system"
+        if has_key(entry, "scope") && entry["scope"] != null && len(str(entry["scope"])) > 0 {
+            scope = entry["scope"]
+        }
+        let pchk = validate_install_path(entry["install_path"], scope)
+        if !pchk["ok"] {
+            return {
+                "ok": false,
+                "actions": [],
+                "skipped": [],
+                "requires_root": false,
+                "error": id + ": " + pchk["reason"]
+            }
+        }
+
+        let cur = ""
+        if has_key(installed, id) && installed[id] != null {
+            cur = str(installed[id])
+        }
+        let target_ver = str(entry["version"])
+        let kind = classify_transition(cur, target_ver)
+        if kind == "noop" {
+            push(skipped, id)
+        } else {
+            if requires_privilege_escalation(scope) {
+                needs_root = true
+            }
+            push(actions, {
+                "id": id,
+                "action": kind,
+                "from": cur,
+                "to": target_ver,
+                "scope": scope,
+                "install_path": entry["install_path"],
+                "url": has_key(entry, "url") ? entry["url"] : "",
+                "sha256": has_key(entry, "sha256") ? entry["sha256"] : ""
+            })
+        }
+        i = i + 1
+    }
+
+    return {
+        "ok": true,
+        "actions": actions,
+        "skipped": skipped,
+        "requires_root": needs_root,
+        "error": ""
+    }
+}
+
+fn plan_check_updates(installed, catalogue, channel) {
+    let updates = []
+    let up_to_date = []
+    let ks = sort(keys(installed))
+    let i = 0
+    while i < len(ks) {
+        let id = ks[i]
+        if has_key(catalogue, id) {
+            let entry = catalogue[id]
+            if matches_channel(entry, channel) {
+                let cur = str(installed[id])
+                let latest = str(entry["version"])
+                if compare_semver(cur, latest) < 0 {
+                    push(updates, {
+                        "id": id,
+                        "from": cur,
+                        "to": latest,
+                        "scope": has_key(entry, "scope") ? entry["scope"] : "system"
+                    })
+                } else {
+                    push(up_to_date, id)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return {
+        "ok": true,
+        "updates": updates,
+        "up_to_date": up_to_date
+    }
+}
+
+fn plan_remove(installed, catalogue, target_id, force) {
+    if !has_key(installed, target_id) {
+        return {
+            "ok": false,
+            "actions": [],
+            "blocked_by": [],
+            "requires_root": false,
+            "error": "component is not installed: " + target_id
+        }
+    }
+    let deps = find_reverse_dependents(catalogue, installed, target_id)
+    if len(deps) > 0 && !force {
+        return {
+            "ok": false,
+            "actions": [],
+            "blocked_by": deps,
+            "requires_root": false,
+            "error": "cannot remove " + target_id + ": required by " + join(deps, ", ")
+        }
+    }
+    let scope = "system"
+    let path = ""
+    if has_key(catalogue, target_id) {
+        let entry = catalogue[target_id]
+        if has_key(entry, "scope") && entry["scope"] != null {
+            scope = entry["scope"]
+        }
+        if has_key(entry, "install_path") && entry["install_path"] != null {
+            path = entry["install_path"]
+        }
+    }
+    return {
+        "ok": true,
+        "actions": [{
+            "id": target_id,
+            "action": "remove",
+            "from": str(installed[target_id]),
+            "to": "",
+            "scope": scope,
+            "install_path": path,
+            "url": "",
+            "sha256": ""
+        }],
+        "blocked_by": [],
+        "requires_root": requires_privilege_escalation(scope),
+        "error": ""
+    }
+}
+
+fn plan_system_snapshot_transition(installed, catalogue, target_snapshot) {
+    let target_ids = sort(keys(target_snapshot))
+    let actions = []
+    let skipped = []
+    let needs_root = false
+
+    // 1. Remove installed components not present in the target snapshot
+    let inst_ids = sort(keys(installed))
+    let i = 0
+    while i < len(inst_ids) {
+        let id = inst_ids[i]
+        if !has_key(target_snapshot, id) {
+            let scope = "system"
+            let path = ""
+            if has_key(catalogue, id) {
+                let entry = catalogue[id]
+                if has_key(entry, "scope") && entry["scope"] != null { scope = entry["scope"] }
+                if has_key(entry, "install_path") && entry["install_path"] != null { path = entry["install_path"] }
+            }
+            if requires_privilege_escalation(scope) { needs_root = true }
+            push(actions, {
+                "id": id,
+                "action": "remove",
+                "from": str(installed[id]),
+                "to": "",
+                "scope": scope,
+                "install_path": path,
+                "url": "",
+                "sha256": ""
+            })
+        }
+        i = i + 1
+    }
+
+    // 2. Install, upgrade, or downgrade components in the target snapshot
+    let j = 0
+    while j < len(target_ids) {
+        let id = target_ids[j]
+        let want_ver = str(target_snapshot[id])
+        let cur_ver = has_key(installed, id) ? str(installed[id]) : ""
+        let kind = classify_transition(cur_ver, want_ver)
+        if kind == "noop" {
+            push(skipped, id)
+        } else {
+            let scope = "system"
+            let path = ""
+            let url = ""
+            let sha = ""
+            if has_key(catalogue, id) {
+                let entry = catalogue[id]
+                if has_key(entry, "scope") && entry["scope"] != null { scope = entry["scope"] }
+                if has_key(entry, "install_path") && entry["install_path"] != null { path = entry["install_path"] }
+                if has_key(entry, "url") && entry["url"] != null { url = entry["url"] }
+                if has_key(entry, "sha256") && entry["sha256"] != null { sha = entry["sha256"] }
+            }
+            let pchk = validate_install_path(path, scope)
+            if !pchk["ok"] {
+                return { "ok": false, "actions": [], "skipped": [], "requires_root": false, "error": id + ": " + pchk["reason"] }
+            }
+            if requires_privilege_escalation(scope) { needs_root = true }
+            push(actions, {
+                "id": id,
+                "action": kind,
+                "from": cur_ver,
+                "to": want_ver,
+                "scope": scope,
+                "install_path": path,
+                "url": url,
+                "sha256": sha
+            })
+        }
+        j = j + 1
+    }
+
+    return {
+        "ok": true,
+        "actions": actions,
+        "skipped": skipped,
+        "requires_root": needs_root,
+        "error": ""
+    }
+}
