@@ -1,0 +1,89 @@
+// DFS topological dependency solver, cycle detector, and reverse-dependency analyzer.
+
+fn dfs_visit(id, catalogue, visiting, visited, order, err_box) {
+    if len(err_box["msg"]) > 0 {
+        return null
+    }
+    if has_key(visited, id) {
+        return null
+    }
+    if has_key(visiting, id) {
+        err_box["msg"] = "dependency cycle detected at " + id
+        return null
+    }
+    if !has_key(catalogue, id) {
+        err_box["msg"] = "unknown component: " + id
+        return null
+    }
+
+    visiting[id] = true
+    let entry = catalogue[id]
+    if has_key(entry, "depends") && entry["depends"] != null {
+        let deps = entry["depends"]
+        let i = 0
+        while i < len(deps) {
+            let dep = deps[i]
+            let dep_id = dep["id"]
+            if !has_key(catalogue, dep_id) {
+                err_box["msg"] = id + " depends on missing component: " + dep_id
+                return null
+            }
+            if has_key(dep, "min_version") && dep["min_version"] != null && len(str(dep["min_version"])) > 0 {
+                let avail = catalogue[dep_id]["version"]
+                if !satisfies_constraint(avail, str(dep["min_version"])) {
+                    err_box["msg"] = id + " requires " + dep_id + " " + str(dep["min_version"]) + " but catalogue has " + str(avail)
+                    return null
+                }
+            }
+            dfs_visit(dep_id, catalogue, visiting, visited, order, err_box)
+            if len(err_box["msg"]) > 0 {
+                return null
+            }
+            i = i + 1
+        }
+    }
+    delete_key(visiting, id)
+    visited[id] = true
+    push(order, id)
+    return null
+}
+
+fn resolve_install_order(catalogue, targets) {
+    let visiting = {}
+    let visited = {}
+    let order = []
+    let err_box = { "msg": "" }
+    let i = 0
+    while i < len(targets) {
+        dfs_visit(targets[i], catalogue, visiting, visited, order, err_box)
+        if len(err_box["msg"]) > 0 {
+            return { "ok": false, "order": [], "error": err_box["msg"] }
+        }
+        i = i + 1
+    }
+    return { "ok": true, "order": order, "error": "" }
+}
+
+fn find_reverse_dependents(catalogue, installed, target_id) {
+    let dependents = []
+    let ks = sort(keys(installed))
+    let i = 0
+    while i < len(ks) {
+        let id = ks[i]
+        if id != target_id && has_key(catalogue, id) {
+            let entry = catalogue[id]
+            if has_key(entry, "depends") && entry["depends"] != null {
+                let deps = entry["depends"]
+                let j = 0
+                while j < len(deps) {
+                    if deps[j]["id"] == target_id {
+                        push(dependents, id)
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return dependents
+}
