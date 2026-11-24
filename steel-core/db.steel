@@ -1,0 +1,143 @@
+// JSON-backed component database, file ownership table, journal, and rollback engine.
+
+fn db_default_state() {
+    return {
+        "schema_version": 2,
+        "installed": {},
+        "ownership": {},
+        "journal": [],
+        "config": {
+            "channel": "stable",
+            "auto_check": true,
+            "catalogue_url": "https://updates.infinityos.uk/catalogue.json",
+            "cache_ttl_sec": 3600
+        }
+    }
+}
+
+fn db_load_from_path(db_path) {
+    if !file_exists(db_path) {
+        return db_default_state()
+    }
+    let raw = read_file(db_path)
+    if len(trim(raw)) == 0 {
+        return db_default_state()
+    }
+    let parsed = json_parse(raw)
+    if parsed == null || type(parsed) != "map" {
+        return db_default_state()
+    }
+    if !has_key(parsed, "installed") { parsed["installed"] = {} }
+    if !has_key(parsed, "ownership") { parsed["ownership"] = {} }
+    if !has_key(parsed, "journal") { parsed["journal"] = [] }
+    if !has_key(parsed, "config") { parsed["config"] = db_default_state()["config"] }
+    return parsed
+}
+
+fn db_save_to_path(db_path, state) {
+    return write_file(db_path, json_stringify(state))
+}
+
+fn db_apply_transaction(state, actions, timestamp) {
+    let tx_id = "tx-" + str(len(state["journal"]) + 1)
+    let installed = state["installed"]
+    let record_ops = []
+    let i = 0
+    while i < len(actions) {
+        let a = actions[i]
+        let id = a["id"]
+        let kind = a["action"]
+        let prev_ver = has_key(installed, id) ? str(installed[id]) : ""
+        if kind == "remove" {
+            delete_key(installed, id)
+        } else {
+            installed[id] = a["to"]
+        }
+        push(record_ops, {
+            "id": id,
+            "action": kind,
+            "from": prev_ver,
+            "to": a["to"],
+            "install_path": a["install_path"]
+        })
+        i = i + 1
+    }
+    let entry = {
+        "tx_id": tx_id,
+        "timestamp": timestamp,
+        "status": "committed",
+        "ops": record_ops
+    }
+    push(state["journal"], entry)
+    return { "ok": true, "tx_id": tx_id, "state": state }
+}
+
+fn db_rollback_last(state, timestamp) {
+    let journal = state["journal"]
+    if len(journal) == 0 {
+        return { "ok": false, "error": "no transactions in journal", "state": state }
+    }
+    let idx = len(journal) - 1
+    while idx >= 0 && journal[idx]["status"] != "committed" {
+        idx = idx - 1
+    }
+    if idx < 0 {
+        return { "ok": false, "error": "no committed transaction to roll back", "state": state }
+    }
+    let tx = journal[idx]
+    let ops = tx["ops"]
+    let installed = state["installed"]
+    let reverted = []
+    let j = len(ops) - 1
+    while j >= 0 {
+        let op = ops[j]
+        let id = op["id"]
+        let from_ver = op["from"]
+        if len(from_ver) == 0 {
+            delete_key(installed, id)
+        } else {
+            installed[id] = from_ver
+        }
+        push(reverted, { "id": id, "restored_version": from_ver })
+        j = j - 1
+    }
+    tx["status"] = "rolled_back"
+    tx["rolled_back_at"] = timestamp
+    return {
+        "ok": true,
+        "tx_id": tx["tx_id"],
+        "reverted": reverted,
+        "state": state
+    }
+}
+
+fn db_set_config(state, key, value) {
+    let cfg = state["config"]
+    if key == "channel" {
+        if value != "stable" && value != "beta" && value != "nightly" {
+            return { "ok": false, "error": "invalid channel: " + str(value) }
+        }
+        cfg["channel"] = value
+        return { "ok": true, "error": "" }
+    }
+    if key == "auto_check" {
+        cfg["auto_check"] = value == "true" || value == true
+        return { "ok": true, "error": "" }
+    }
+    if key == "catalogue_url" {
+        if !starts_with(str(value), "https://") {
+            return { "ok": false, "error": "catalogue_url must use https://" }
+        }
+        cfg["catalogue_url"] = str(value)
+        return { "ok": true, "error": "" }
+    }
+    if key == "cache_ttl_sec" {
+        let n = int(num(value))
+        if n < 60 {
+            return { "ok": false, "error": "cache_ttl_sec must be at least 60" }
+        }
+        cfg["cache_ttl_sec"] = n
+        return { "ok": true, "error": "" }
+    }
+    return { "ok": false, "error": "unknown config key: " + str(key) }
+}
