@@ -1,0 +1,86 @@
+// Packaging manifest builder, catalogue publisher, and privileged helper request policy.
+
+fn build_package_manifest(id, version, scope, install_path, sha256, signature, files) {
+    let entry_check = validate_catalogue_entry(id, {
+        "version": version,
+        "scope": scope,
+        "install_path": install_path,
+        "sha256": sha256
+    })
+    if !entry_check["ok"] {
+        return { "ok": false, "error": entry_check["reason"], "manifest": null }
+    }
+    let arch_check = validate_archive_manifest(files)
+    if !arch_check["ok"] {
+        return { "ok": false, "error": arch_check["reason"], "manifest": null }
+    }
+    if signature != null && len(str(signature)) > 0 && !validate_ed25519_sig(str(signature)) {
+        return { "ok": false, "error": "invalid ed25519 signature hex", "manifest": null }
+    }
+    return {
+        "ok": true,
+        "error": "",
+        "manifest": {
+            "id": id,
+            "version": version,
+            "scope": scope,
+            "install_path": install_path,
+            "sha256": lower(str(sha256)),
+            "signature": signature != null ? lower(str(signature)) : "",
+            "file_count": len(files),
+            "files": files
+        }
+    }
+}
+
+fn publish_catalogue_entry(catalogue, id, entry) {
+    let chk = validate_catalogue_entry(id, entry)
+    if !chk["ok"] {
+        return { "ok": false, "error": chk["reason"], "catalogue": catalogue }
+    }
+    if has_key(catalogue, id) {
+        let prev = catalogue[id]["version"]
+        if compare_semver(entry["version"], prev) < 0 {
+            return {
+                "ok": false,
+                "error": "cannot publish older version " + str(entry["version"]) + " over " + str(prev),
+                "catalogue": catalogue
+            }
+        }
+    }
+    catalogue[id] = entry
+    return { "ok": true, "error": "", "catalogue": catalogue }
+}
+
+fn validate_helper_request(req) {
+    if req == null || type(req) != "map" {
+        return { "ok": false, "reason": "helper request must be a JSON object" }
+    }
+    if !has_key(req, "op") || !has_key(req, "component_id") || !has_key(req, "install_path") {
+        return { "ok": false, "reason": "missing required helper fields (op, component_id, install_path)" }
+    }
+    let op = str(req["op"])
+    if op != "install" && op != "upgrade" && op != "downgrade" && op != "remove" {
+        return { "ok": false, "reason": "unsupported helper op: " + op }
+    }
+    let id = str(req["component_id"])
+    if !is_valid_component_id(id) {
+        return { "ok": false, "reason": "invalid component_id: " + id }
+    }
+    let scope = has_key(req, "scope") && req["scope"] != null ? str(req["scope"]) : "system"
+    let pchk = validate_install_path(str(req["install_path"]), scope)
+    if !pchk["ok"] {
+        return pchk
+    }
+    if op != "remove" {
+        if !has_key(req, "archive_path") || len(trim(str(req["archive_path"]))) == 0 {
+            return { "ok": false, "reason": "archive_path required for " + op }
+        }
+        if has_key(req, "sha256") && req["sha256"] != null && len(str(req["sha256"])) > 0 {
+            if !validate_sha256(str(req["sha256"])) {
+                return { "ok": false, "reason": "invalid sha256 in helper request" }
+            }
+        }
+    }
+    return { "ok": true, "reason": "" }
+}
