@@ -1,0 +1,112 @@
+// Privileged pkexec helper logic with on-disk transactional backup & rollback in Steel.
+
+fn helper_check_dpkg_owner(target_path) {
+    let res = exec("dpkg", ["-S", target_path])
+    if res != null && type(res) == "map" && res["code"] == 0 && len(trim(str(res["stdout"]))) > 0 {
+        return { "ok": false, "reason": "path owned by dpkg: " + trim(str(res["stdout"])) }
+    }
+    return { "ok": true, "reason": "" }
+}
+
+fn helper_backup_path(backup_root, tx_id, component_id) {
+    let root = (backup_root != null && len(trim(str(backup_root))) > 0)
+        ? str(backup_root)
+        : "/var/lib/infinityos-updater/backups"
+    let tx = (tx_id != null && len(trim(str(tx_id))) > 0) ? str(tx_id) : "tx-current"
+    return root + "/" + tx + "/" + str(component_id)
+}
+
+fn helper_create_backup(dest, backup_path) {
+    if !file_exists(dest) {
+        return { "ok": true, "backed_up": false, "backup_path": "" }
+    }
+    let parent_idx = len(backup_path) - 1
+    while parent_idx > 0 && slice(backup_path, parent_idx, parent_idx + 1) != "/" {
+        parent_idx = parent_idx - 1
+    }
+    let parent_dir = slice(backup_path, 0, parent_idx)
+    if len(parent_dir) > 0 {
+        mkdir(parent_dir)
+    }
+    if file_exists(backup_path) {
+        remove_dir(backup_path)
+    }
+    if !rename(dest, backup_path) {
+        return { "ok": false, "backed_up": false, "backup_path": "" }
+    }
+    return { "ok": true, "backed_up": true, "backup_path": backup_path }
+}
+
+fn helper_restore_backup(dest, backup_path) {
+    if file_exists(dest) {
+        remove_dir(dest)
+    }
+    if backup_path != null && len(str(backup_path)) > 0 && file_exists(str(backup_path)) {
+        if !rename(str(backup_path), dest) {
+            return { "ok": false, "error": "failed to restore backup from " + str(backup_path) }
+        }
+    }
+    return { "ok": true, "error": "" }
+}
+
+fn helper_execute_request(req_json) {
+    let req = json_parse(req_json)
+    if req != null && type(req) == "map" && has_key(req, "op") && req["op"] == "restore_backup" {
+        let dest = str(req["install_path"])
+        let bp = str(req["backup_path"])
+        let r = helper_restore_backup(dest, bp)
+        return { "exit_code": r["ok"] ? 0 : 1, "error": r["error"] }
+    }
+
+    let chk = validate_helper_request(req)
+    if !chk["ok"] {
+        return { "exit_code": 2, "error": "policy rejected request: " + chk["reason"] }
+    }
+
+    let op = str(req["op"])
+    let id = str(req["component_id"])
+    let dest = str(req["install_path"])
+    let dpkg_chk = helper_check_dpkg_owner(dest)
+    if !dpkg_chk["ok"] {
+        return { "exit_code": 3, "error": dpkg_chk["reason"] }
+    }
+
+    let b_root = has_key(req, "backup_root") ? req["backup_root"] : ""
+    let tx_id = has_key(req, "tx_id") ? req["tx_id"] : "tx-current"
+    let b_path = helper_backup_path(b_root, tx_id, id)
+
+    if op == "remove" {
+        let b = helper_create_backup(dest, b_path)
+        if !b["ok"] {
+            return { "exit_code": 1, "error": "failed to back up " + dest + " before remove" }
+        }
+        return { "exit_code": 0, "error": "", "backup_path": b["backup_path"] }
+    }
+
+    let archive = str(req["archive_path"])
+    if has_key(req, "sha256") && req["sha256"] != null && len(str(req["sha256"])) > 0 {
+        let actual = sha256_file(archive)
+        if lower(actual) != lower(str(req["sha256"])) {
+            return {
+                "exit_code": 4,
+                "error": "sha256 mismatch: expected " + str(req["sha256"]) + ", got " + actual
+            }
+        }
+    }
+
+    let b = helper_create_backup(dest, b_path)
+    if !b["ok"] {
+        return { "exit_code": 1, "error": "failed to create on-disk backup for " + dest }
+    }
+
+    if !mkdir(dest) {
+        helper_restore_backup(dest, b["backup_path"])
+        return { "exit_code": 1, "error": "failed to create destination dir " + dest }
+    }
+    return {
+        "exit_code": 0,
+        "error": "",
+        "backup_path": b["backup_path"],
+        "extract": { "archive": archive, "dest": dest }
+    }
+}
