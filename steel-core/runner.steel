@@ -1,0 +1,77 @@
+// Standalone CLI runner orchestration in Steel (reads env/args/state, saves atomically via rename).
+
+fn runner_atomic_write(path, content) {
+    let tmp = path + ".tmp"
+    if !write_file(tmp, content) {
+        return false
+    }
+    return rename(tmp, path)
+}
+
+fn runner_cli_main() {
+    let state_path = env("INFINITY_STATE_PATH")
+    if state_path == null || len(str(state_path)) == 0 {
+        state_path = "infinity-state.json"
+    }
+    let cat_path = env("INFINITY_CATALOGUE_PATH")
+    if cat_path == null || len(str(cat_path)) == 0 {
+        cat_path = "catalogue.json"
+    }
+
+    let state = db_load_from_path(state_path)
+    let catalogue = {}
+    if file_exists(cat_path) {
+        let raw_cat = read_file(cat_path)
+        if len(trim(raw_cat)) > 0 {
+            let parsed = json_parse(raw_cat)
+            if parsed != null && type(parsed) == "map" {
+                catalogue = parsed
+            }
+        }
+    }
+
+    let argv = args()
+    let ts = int(clock())
+    let outcome = cli_dispatch(argv, state, catalogue, ts)
+
+    if len(str(outcome["output"])) > 0 {
+        print(outcome["output"])
+    }
+
+    if outcome["save_state"] {
+        if !runner_atomic_write(state_path, json_stringify(outcome["state"])) {
+            print("Error saving state to " + state_path)
+            return { "exit_code": 1, "actions": [] }
+        }
+    }
+
+    return {
+        "exit_code": outcome["exit_code"],
+        "actions": outcome["actions"]
+    }
+}
+
+fn runner_publish_catalogue(cat_path, id, entry_path) {
+    if !file_exists(entry_path) {
+        return { "exit_code": 1, "output": "Error: entry file not found: " + entry_path }
+    }
+    let entry = json_parse(read_file(entry_path))
+    let cat = {}
+    if file_exists(cat_path) {
+        let raw = read_file(cat_path)
+        if len(trim(raw)) > 0 {
+            let parsed = json_parse(raw)
+            if parsed != null && type(parsed) == "map" {
+                cat = parsed
+            }
+        }
+    }
+    let res = publish_catalogue_entry(cat, id, entry)
+    if !res["ok"] {
+        return { "exit_code": 1, "output": "publish rejected: " + res["error"] }
+    }
+    if !runner_atomic_write(cat_path, json_stringify(res["catalogue"])) {
+        return { "exit_code": 1, "output": "Error writing catalogue to " + cat_path }
+    }
+    return { "exit_code": 0, "output": "Published " + id + " to " + cat_path }
+}

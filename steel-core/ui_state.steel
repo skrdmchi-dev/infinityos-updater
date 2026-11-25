@@ -1,0 +1,84 @@
+// GUI view-model and controller state reducer (tab routing, filters, selection, banners).
+
+fn ui_initial_state() {
+    return {
+        "active_tab": "updates",
+        "search_query": "",
+        "selected_ids": [],
+        "busy": false,
+        "banner_level": "info",
+        "banner_text": "Ready",
+        "pending_plan": null
+    }
+}
+
+fn ui_toggle_selection(selected, id) {
+    let out = []
+    let found = false
+    let i = 0
+    while i < len(selected) {
+        if selected[i] == id {
+            found = true
+        } else {
+            push(out, selected[i])
+        }
+        i = i + 1
+    }
+    if !found {
+        push(out, id)
+    }
+    return out
+}
+
+fn ui_reduce(ui_state, event, db_state, catalogue) {
+    let kind = event["type"]
+    if kind == "switch_tab" {
+        let tab = event["tab"]
+        if tab == "updates" || tab == "installed" || tab == "explore" || tab == "history" || tab == "settings" {
+            ui_state["active_tab"] = tab
+        }
+        return ui_state
+    }
+    if kind == "set_search" {
+        ui_state["search_query"] = str(event["query"])
+        return ui_state
+    }
+    if kind == "toggle_select" {
+        ui_state["selected_ids"] = ui_toggle_selection(ui_state["selected_ids"], str(event["id"]))
+        return ui_state
+    }
+    if kind == "select_all_updates" {
+        let chk = plan_check_updates(db_state["installed"], catalogue, db_state["config"]["channel"])
+        let ids = []
+        let ups = chk["updates"]
+        let i = 0
+        while i < len(ups) {
+            push(ids, ups[i]["id"])
+            i = i + 1
+        }
+        ui_state["selected_ids"] = ids
+        ui_state["banner_level"] = "info"
+        ui_state["banner_text"] = str(len(ids)) + " updates selected"
+        return ui_state
+    }
+    if kind == "preview_plan" {
+        let plan = plan_reconcile(db_state["installed"], catalogue, ui_state["selected_ids"])
+        ui_state["pending_plan"] = plan
+        if !plan["ok"] {
+            ui_state["banner_level"] = "error"
+            ui_state["banner_text"] = plan["error"]
+        } else {
+            ui_state["banner_level"] = "success"
+            ui_state["banner_text"] = "Ready to apply " + str(len(plan["actions"])) + " actions"
+        }
+        return ui_state
+    }
+    if kind == "clear_selection" {
+        ui_state["selected_ids"] = []
+        ui_state["pending_plan"] = null
+        ui_state["banner_level"] = "info"
+        ui_state["banner_text"] = "Selection cleared"
+        return ui_state
+    }
+    return ui_state
+}
