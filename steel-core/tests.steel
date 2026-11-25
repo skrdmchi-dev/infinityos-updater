@@ -1,0 +1,131 @@
+// Comprehensive Steel self-test suite covering all InfinityOS Updater modules.
+
+fn test_sample_catalogue() {
+    let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    return {
+        "origin-core": {
+            "version": "1.1.0",
+            "install_path": "/usr/share/gnome-shell/extensions/Origin@appscreen",
+            "scope": "system",
+            "description": "Origin shell core",
+            "channel": "stable",
+            "url": "https://updates.infinityos.uk/origin-core-1.1.0.tar.xz",
+            "sha256": sha_a,
+            "depends": []
+        },
+        "origin-cc": {
+            "version": "1.0.0",
+            "install_path": "/usr/share/gnome-shell/extensions/OriginUICC@quandz24.extension",
+            "scope": "system",
+            "description": "Origin control center",
+            "channel": "stable",
+            "url": "https://updates.infinityos.uk/origin-cc-1.0.0.tar.xz",
+            "sha256": sha_b,
+            "depends": [{ "id": "origin-core", "min_version": ">=1.1.0" }]
+        }
+    }
+}
+
+fn test_semver_suite() {
+    assert(compare_semver("1.2.3", "1.2.3") == 0, "semver eq")
+    assert(compare_semver("1.2.3", "1.2.4") == -1, "semver lt")
+    assert(compare_semver("2.0.0", "1.9.9") == 1, "semver gt")
+    assert(compare_semver("1.0.0-beta.2", "1.0.0") == -1, "semver prerelease")
+    assert(compare_semver("v1.0.0", "1.0.0") == 0, "semver v-prefix")
+    assert(satisfies_constraint("1.4.0", "^1.2.0"), "caret ok")
+    assert(!satisfies_constraint("2.0.0", "^1.2.0"), "caret major reject")
+    assert(satisfies_constraint("1.2.9", "~1.2.3"), "tilde ok")
+    assert(!satisfies_constraint("1.3.0", "~1.2.3"), "tilde minor reject")
+    assert(classify_transition("", "1.0.0") == "install", "classify install")
+    assert(classify_transition("1.0.0", "1.1.0") == "upgrade", "classify upgrade")
+    assert(classify_transition("1.1.0", "1.0.0") == "downgrade", "classify downgrade")
+    assert(classify_transition("1.0.0", "1.0.0") == "noop", "classify noop")
+    return true
+}
+
+fn test_security_policy_suite() {
+    let ok = validate_install_path("/usr/share/icons/Radience", "system")
+    assert(ok["ok"], "valid system icon path")
+    let bad_etc = validate_install_path("/etc/shadow", "system")
+    assert(!bad_etc["ok"], "block /etc")
+    let bad_trav = validate_install_path("/usr/share/icons/../../etc/passwd", "system")
+    assert(!bad_trav["ok"], "block traversal")
+    let bad_slash = validate_install_path("/usr/share//icons/Radience", "system")
+    assert(!bad_slash["ok"], "block duplicate slash")
+    let user_ok = validate_install_path("~/.local/share/icons/Radience", "user")
+    assert(user_ok["ok"], "valid user path")
+    let zip_ok = validate_archive_manifest(["usr/file.txt", "meta/info.json"])
+    assert(zip_ok["ok"], "valid archive entries")
+    let zip_bad = validate_archive_manifest(["ok/file.txt", "../escape"])
+    assert(!zip_bad["ok"], "block zip-slip")
+    assert(validate_sha256(sha256("infinityos")), "valid sha256 output")
+    return true
+}
+
+fn test_solver_and_reconciler_suite() {
+    let cat = test_sample_catalogue()
+    let cat_chk = validate_catalogue(cat)
+    assert(cat_chk["ok"] && cat_chk["count"] == 2, "catalogue valid")
+
+    let plan = plan_reconcile({}, cat, ["origin-cc"])
+    assert(plan["ok"], "reconcile plan ok")
+    assert(len(plan["actions"]) == 2, "reconcile installs dep first")
+    assert(plan["actions"][0]["id"] == "origin-core", "dep ordered first")
+    assert(plan["actions"][1]["id"] == "origin-cc", "target ordered second")
+
+    // Cycle detection
+    let cyclic = {
+        "a": { "version": "1.0.0", "install_path": "/usr/share/icons/A", "scope": "system", "depends": [{ "id": "b" }] },
+        "b": { "version": "1.0.0", "install_path": "/usr/share/icons/B", "scope": "system", "depends": [{ "id": "a" }] }
+    }
+    let cyc_res = resolve_install_order(cyclic, ["a"])
+    assert(!cyc_res["ok"] && contains(cyc_res["error"], "cycle"), "cycle detected")
+
+    // System snapshot transition (downgrade + remove newer component)
+    let installed = { "origin-core": "1.1.0", "origin-cc": "1.0.0" }
+    let snap = { "origin-core": "1.0.0" }
+    let sp = plan_system_snapshot_transition(installed, cat, snap)
+    assert(sp["ok"] && len(sp["actions"]) == 2, "snapshot transition count")
+    assert(sp["actions"][0]["id"] == "origin-cc" && sp["actions"][0]["action"] == "remove", "snapshot removes newer")
+    assert(sp["actions"][1]["id"] == "origin-core" && sp["actions"][1]["action"] == "downgrade", "snapshot downgrades")
+    return true
+}
+
+fn test_cli_db_and_ui_suite() {
+    let cat = test_sample_catalogue()
+    let st = db_default_state()
+    let res = cli_dispatch(["install", "origin-cc"], st, cat, 1700000000)
+    assert(res["exit_code"] == 0 && len(res["actions"]) == 2 && res["save_state"], "cli install")
+    let rb = cli_dispatch(["rollback"], res["state"], cat, 1700000010)
+    assert(rb["exit_code"] == 0, "cli rollback")
+    let list_after = cli_dispatch(["list", "--json"], rb["state"], cat, 1700000020)
+    assert(list_after["output"] == "{}", "rollback cleared installed")
+
+    let ui0 = ui_initial_state()
+    let ui1 = ui_reduce(ui0, { "type": "toggle_select", "id": "origin-cc" }, db_default_state(), cat)
+    let ui2 = ui_reduce(ui1, { "type": "preview_plan" }, db_default_state(), cat)
+    assert(ui2["banner_level"] == "success", "ui preview plan success")
+    return true
+}
+
+fn test_helper_policy_suite() {
+    let bad = helper_execute_request(json_stringify({
+        "op": "install",
+        "component_id": "origin-core",
+        "scope": "system",
+        "install_path": "/etc/passwd",
+        "archive_path": "x.tar.xz"
+    }))
+    assert(bad["exit_code"] == 2, "helper rejects /etc/passwd")
+    return true
+}
+
+fn run_all_steel_self_tests() {
+    assert(test_semver_suite(), "semver suite")
+    assert(test_security_policy_suite(), "security suite")
+    assert(test_solver_and_reconciler_suite(), "solver suite")
+    assert(test_cli_db_and_ui_suite(), "cli/db/ui suite")
+    assert(test_helper_policy_suite(), "helper suite")
+    return true
+}

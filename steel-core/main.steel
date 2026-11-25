@@ -1,0 +1,102 @@
+// InfinityOS Updater Steel core entrypoints compiled to Rust.
+import "semver.steel"
+import "policy.steel"
+import "model.steel"
+import "solver.steel"
+import "reconciler.steel"
+import "db.steel"
+import "cli.steel"
+import "ui_state.steel"
+import "pkg.steel"
+import "helper.steel"
+import "runner.steel"
+import "tests.steel"
+
+fn steel_compare_semver(a, b) {
+    return compare_semver(a, b)
+}
+
+fn steel_satisfies_constraint(ver, constraint) {
+    return satisfies_constraint(ver, constraint)
+}
+
+fn steel_validate_path_json(path, scope) {
+    return json_stringify(validate_install_path(path, scope))
+}
+
+fn steel_validate_archive_json(entries_json) {
+    let entries = json_parse(entries_json)
+    return json_stringify(validate_archive_manifest(entries))
+}
+
+fn steel_validate_catalogue_json(catalogue_json) {
+    let cat = json_parse(catalogue_json)
+    return json_stringify(validate_catalogue(cat))
+}
+
+fn steel_plan_reconcile(installed_json, catalogue_json, targets_json) {
+    let installed = json_parse(installed_json)
+    let catalogue = json_parse(catalogue_json)
+    let targets = json_parse(targets_json)
+    return json_stringify(plan_reconcile(installed, catalogue, targets))
+}
+
+fn steel_plan_remove(installed_json, catalogue_json, target_id, force) {
+    let installed = json_parse(installed_json)
+    let catalogue = json_parse(catalogue_json)
+    return json_stringify(plan_remove(installed, catalogue, target_id, force))
+}
+
+fn steel_cli_dispatch(args_json, state_json, catalogue_json, timestamp) {
+    let args = json_parse(args_json)
+    let state = len(trim(state_json)) > 0 ? json_parse(state_json) : db_default_state()
+    let catalogue = len(trim(catalogue_json)) > 0 ? json_parse(catalogue_json) : {}
+    return json_stringify(cli_dispatch(args, state, catalogue, timestamp))
+}
+
+fn steel_ui_reduce(ui_json, event_json, state_json, catalogue_json) {
+    let ui = len(trim(ui_json)) > 0 ? json_parse(ui_json) : ui_initial_state()
+    let ev = json_parse(event_json)
+    let st = len(trim(state_json)) > 0 ? json_parse(state_json) : db_default_state()
+    let cat = len(trim(catalogue_json)) > 0 ? json_parse(catalogue_json) : {}
+    return json_stringify(ui_reduce(ui, ev, st, cat))
+}
+
+fn steel_build_manifest_json(id, version, scope, install_path, sha256, signature, files_json) {
+    let files = json_parse(files_json)
+    return json_stringify(build_package_manifest(id, version, scope, install_path, sha256, signature, files))
+}
+
+fn steel_publish_entry_json(catalogue_json, id, entry_json) {
+    let cat = len(trim(catalogue_json)) > 0 ? json_parse(catalogue_json) : {}
+    let entry = json_parse(entry_json)
+    return json_stringify(publish_catalogue_entry(cat, id, entry))
+}
+
+fn steel_validate_helper_request_json(req_json) {
+    let req = json_parse(req_json)
+    return json_stringify(validate_helper_request(req))
+}
+
+fn steel_helper_run_json(req_json) {
+    return json_stringify(helper_execute_request(req_json))
+}
+
+fn steel_runner_cli_json() {
+    return json_stringify(runner_cli_main())
+}
+
+fn steel_runner_publish_json(cat_path, id, entry_path) {
+    return json_stringify(runner_publish_catalogue(cat_path, id, entry_path))
+}
+
+fn steel_plan_snapshot_json(installed_json, catalogue_json, snapshot_json) {
+    let installed = json_parse(installed_json)
+    let catalogue = json_parse(catalogue_json)
+    let snapshot = json_parse(snapshot_json)
+    return json_stringify(plan_system_snapshot_transition(installed, catalogue, snapshot))
+}
+
+fn steel_run_self_tests() {
+    return run_all_steel_self_tests()
+}
