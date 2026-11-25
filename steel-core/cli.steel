@@ -1,0 +1,239 @@
+// CLI argument parser, command router, and table/JSON output formatters.
+
+fn parse_cli_flags(args) {
+    let positional = []
+    let flags = {
+        "json": false,
+        "dry_run": false,
+        "force": false,
+        "channel": ""
+    }
+    let i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "--json" {
+            flags["json"] = true
+        } else if a == "--dry-run" {
+            flags["dry_run"] = true
+        } else if a == "--force" || a == "-f" {
+            flags["force"] = true
+        } else if a == "--channel" && i + 1 < len(args) {
+            i = i + 1
+            flags["channel"] = args[i]
+        } else {
+            push(positional, a)
+        }
+        i = i + 1
+    }
+    return { "positional": positional, "flags": flags }
+}
+
+fn format_help_text() {
+    let lines = [
+        "InfinityOS Updater (Steel-compiled core)",
+        "",
+        "Usage: infinity-updater <command> [args] [flags]",
+        "",
+        "Commands:",
+        "  status              Show installed components and pending updates",
+        "  list                List installed components",
+        "  search [query]      Search catalogue components",
+        "  check               Check for available updates",
+        "  install <id...>     Plan/install one or more components",
+        "  upgrade [id...]     Plan/upgrade installed components",
+        "  remove <id>         Plan/remove an installed component",
+        "  rollback            Roll back the most recent transaction",
+        "  history             Show transaction journal",
+        "  verify              Validate catalogue schema and security policy",
+        "  config [k] [v]      Show or update configuration",
+        "",
+        "Flags:",
+        "  --json              Emit machine-readable JSON output",
+        "  --dry-run           Plan actions without modifying state",
+        "  --force, -f         Bypass reverse-dependency checks on remove",
+        "  --channel <name>    Filter channel (stable|beta|nightly)"
+    ]
+    return join(lines, "\n")
+}
+
+fn format_plan_lines(plan) {
+    if !plan["ok"] {
+        return "Error: " + str(plan["error"])
+    }
+    let lines = []
+    let acts = plan["actions"]
+    let i = 0
+    while i < len(acts) {
+        let a = acts[i]
+        let arrow = len(a["from"]) > 0 ? (a["from"] + " -> " + a["to"]) : a["to"]
+        if a["action"] == "remove" {
+            arrow = a["from"]
+        }
+        push(lines, "  [" + upper(a["action"]) + "] " + a["id"] + " (" + arrow + ") -> " + a["install_path"])
+        i = i + 1
+    }
+    if len(plan["skipped"]) > 0 {
+        push(lines, "  [SKIP] already up to date: " + join(plan["skipped"], ", "))
+    }
+    if len(lines) == 0 {
+        return "Nothing to do."
+    }
+    return join(lines, "\n")
+}
+
+fn cli_dispatch(args, state, catalogue, timestamp) {
+    let parsed = parse_cli_flags(args)
+    let pos = parsed["positional"]
+    let flags = parsed["flags"]
+    let channel = len(flags["channel"]) > 0 ? flags["channel"] : state["config"]["channel"]
+
+    if len(pos) == 0 || pos[0] == "help" || pos[0] == "--help" || pos[0] == "-h" {
+        return { "exit_code": 0, "output": format_help_text(), "actions": [], "save_state": false, "state": state }
+    }
+
+    let cmd = pos[0]
+
+    if cmd == "list" {
+        let ks = sort(keys(state["installed"]))
+        if flags["json"] {
+            return { "exit_code": 0, "output": json_stringify(state["installed"]), "actions": [], "save_state": false, "state": state }
+        }
+        if len(ks) == 0 {
+            return { "exit_code": 0, "output": "No components installed.", "actions": [], "save_state": false, "state": state }
+        }
+        let lines = []
+        let i = 0
+        while i < len(ks) {
+            let id = ks[i]
+            push(lines, pad_end(id, 24, " ") + " " + str(state["installed"][id]))
+            i = i + 1
+        }
+        return { "exit_code": 0, "output": join(lines, "\n"), "actions": [], "save_state": false, "state": state }
+    }
+
+    if cmd == "search" {
+        let q = len(pos) > 1 ? pos[1] : ""
+        let hits = search_catalogue(catalogue, q, channel)
+        if flags["json"] {
+            return { "exit_code": 0, "output": json_stringify(hits), "actions": [], "save_state": false, "state": state }
+        }
+        if len(hits) == 0 {
+            return { "exit_code": 0, "output": "No matching components.", "actions": [], "save_state": false, "state": state }
+        }
+        let lines = []
+        let i = 0
+        while i < len(hits) {
+            let h = hits[i]
+            push(lines, pad_end(h["id"], 22, " ") + " " + pad_end(h["version"], 10, " ") + " " + h["description"])
+            i = i + 1
+        }
+        return { "exit_code": 0, "output": join(lines, "\n"), "actions": [], "save_state": false, "state": state }
+    }
+
+    if cmd == "check" || cmd == "status" {
+        let chk = plan_check_updates(state["installed"], catalogue, channel)
+        if flags["json"] {
+            return { "exit_code": 0, "output": json_stringify(chk), "actions": [], "save_state": false, "state": state }
+        }
+        let ups = chk["updates"]
+        if len(ups) == 0 {
+            return { "exit_code": 0, "output": "All " + str(len(chk["up_to_date"])) + " installed components are up to date.", "actions": [], "save_state": false, "state": state }
+        }
+        let lines = ["Available updates (" + str(len(ups)) + "):"]
+        let i = 0
+        while i < len(ups) {
+            let u = ups[i]
+            push(lines, "  " + u["id"] + ": " + u["from"] + " -> " + u["to"])
+            i = i + 1
+        }
+        return { "exit_code": 0, "output": join(lines, "\n"), "actions": [], "save_state": false, "state": state }
+    }
+
+    if cmd == "verify" {
+        let v = validate_catalogue(catalogue)
+        let out = flags["json"] ? json_stringify(v) : (v["ok"] ? ("Catalogue OK (" + str(v["count"]) + " components).") : ("Catalogue errors:\n  " + join(v["errors"], "\n  ")))
+        return { "exit_code": v["ok"] ? 0 : 1, "output": out, "actions": [], "save_state": false, "state": state }
+    }
+
+    if cmd == "install" || cmd == "upgrade" {
+        let targets = slice(pos, 1, len(pos))
+        if cmd == "upgrade" && len(targets) == 0 {
+            targets = sort(keys(state["installed"]))
+        }
+        if len(targets) == 0 {
+            return { "exit_code": 2, "output": "Error: specify at least one component id", "actions": [], "save_state": false, "state": state }
+        }
+        let plan = plan_reconcile(state["installed"], catalogue, targets)
+        if !plan["ok"] {
+            let out = flags["json"] ? json_stringify(plan) : ("Error: " + plan["error"])
+            return { "exit_code": 1, "output": out, "actions": [], "save_state": false, "state": state }
+        }
+        let should_save = !flags["dry_run"] && len(plan["actions"]) > 0
+        if should_save {
+            db_apply_transaction(state, plan["actions"], timestamp)
+        }
+        let out = flags["json"] ? json_stringify(plan) : format_plan_lines(plan)
+        return { "exit_code": 0, "output": out, "actions": flags["dry_run"] ? [] : plan["actions"], "save_state": should_save, "state": state }
+    }
+
+    if cmd == "remove" {
+        if len(pos) < 2 {
+            return { "exit_code": 2, "output": "Error: specify a component id to remove", "actions": [], "save_state": false, "state": state }
+        }
+        let plan = plan_remove(state["installed"], catalogue, pos[1], flags["force"])
+        if !plan["ok"] {
+            let out = flags["json"] ? json_stringify(plan) : ("Error: " + plan["error"])
+            return { "exit_code": 1, "output": out, "actions": [], "save_state": false, "state": state }
+        }
+        let should_save = !flags["dry_run"]
+        if should_save {
+            db_apply_transaction(state, plan["actions"], timestamp)
+        }
+        let out = flags["json"] ? json_stringify(plan) : format_plan_lines(plan)
+        return { "exit_code": 0, "output": out, "actions": flags["dry_run"] ? [] : plan["actions"], "save_state": should_save, "state": state }
+    }
+
+    if cmd == "rollback" {
+        let rb = db_rollback_last(state, timestamp)
+        if !rb["ok"] {
+            let out = flags["json"] ? json_stringify(rb) : ("Error: " + rb["error"])
+            return { "exit_code": 1, "output": out, "actions": [], "save_state": false, "state": state }
+        }
+        let out = flags["json"] ? json_stringify(rb) : ("Rolled back " + rb["tx_id"] + " (" + str(len(rb["reverted"])) + " components restored).")
+        return { "exit_code": 0, "output": out, "actions": [], "save_state": !flags["dry_run"], "state": state }
+    }
+
+    if cmd == "history" {
+        if flags["json"] {
+            return { "exit_code": 0, "output": json_stringify(state["journal"]), "actions": [], "save_state": false, "state": state }
+        }
+        let j = state["journal"]
+        if len(j) == 0 {
+            return { "exit_code": 0, "output": "No transactions recorded.", "actions": [], "save_state": false, "state": state }
+        }
+        let lines = []
+        let i = 0
+        while i < len(j) {
+            let tx = j[i]
+            push(lines, tx["tx_id"] + " [" + tx["status"] + "] ops=" + str(len(tx["ops"])) + " ts=" + str(tx["timestamp"]))
+            i = i + 1
+        }
+        return { "exit_code": 0, "output": join(lines, "\n"), "actions": [], "save_state": false, "state": state }
+    }
+
+    if cmd == "config" {
+        if len(pos) == 1 {
+            return { "exit_code": 0, "output": json_stringify(state["config"]), "actions": [], "save_state": false, "state": state }
+        }
+        if len(pos) < 3 {
+            return { "exit_code": 2, "output": "Usage: infinity-updater config <key> <value>", "actions": [], "save_state": false, "state": state }
+        }
+        let res = db_set_config(state, pos[1], pos[2])
+        if !res["ok"] {
+            return { "exit_code": 1, "output": "Error: " + res["error"], "actions": [], "save_state": false, "state": state }
+        }
+        return { "exit_code": 0, "output": "Updated " + pos[1] + " = " + pos[2], "actions": [], "save_state": true, "state": state }
+    }
+
+    return { "exit_code": 2, "output": "Unknown command: " + cmd + "\nRun 'infinity-updater help' for usage.", "actions": [], "save_state": false, "state": state }
+}
