@@ -1,0 +1,30 @@
+name: validate catalogue
+
+on:
+  pull_request:
+    paths:
+      - "manifest.json"
+      - "manifest.json.sig"
+      - "components/**"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: run workspace tests
+        run: cargo test --workspace
+      - name: run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: validate catalogue if present
+        run: |
+          if [ -f catalogue/manifest.json ]; then
+            cargo run -p infinity-pkg -- validate-catalogue catalogue/manifest.json
+          fi

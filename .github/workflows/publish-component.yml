@@ -1,0 +1,71 @@
+name: publish component release
+
+on:
+  workflow_dispatch:
+    inputs:
+      component_dir:
+        description: "path to component source directory containing manifest.json and files/"
+        required: true
+        type: string
+      release_tag:
+        description: "git release tag (e.g. infinity-dock-v1.0.0)"
+        required: true
+        type: string
+      update_strategy:
+        description: "update strategy (direct, sequential, or auto)"
+        required: true
+        default: "direct"
+        type: choice
+        options:
+          - direct
+          - sequential
+          - auto
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: validate and package component archive
+        run: |
+          cargo run --release -p infinity-pkg -- validate-manifest "${{ inputs.component_dir }}/manifest.json"
+          cargo run --release -p infinity-pkg -- package "${{ inputs.component_dir }}" dist
+
+      - name: update remote catalogue and sign
+        env:
+          INFINITYOS_SIGNING_KEY: ${{ secrets.INFINITYOS_SIGNING_KEY }}
+        run: |
+          ARCHIVE=$(ls dist/*.tar.xz | head -n 1)
+          cargo run --release -p infinity-pkg -- upsert-catalogue \
+            catalogue/manifest.json \
+            "${{ inputs.component_dir }}/manifest.json" \
+            "$ARCHIVE" \
+            "${{ inputs.release_tag }}" \
+            "${{ inputs.update_strategy }}"
+          cargo run --release -p infinity-pkg -- sign-catalogue \
+            catalogue/manifest.json \
+            catalogue/manifest.json.sig \
+            INFINITYOS_SIGNING_KEY
+
+      - name: publish github release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARCHIVE=$(ls dist/*.tar.xz | head -n 1)
+          gh release create "${{ inputs.release_tag }}" "$ARCHIVE" \
+            --title "${{ inputs.release_tag }}" \
+            --notes "Automated component release via infinity-pkg"
+
+      - name: commit updated catalogue
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add catalogue/manifest.json catalogue/manifest.json.sig
+          git commit -m "update catalogue for ${{ inputs.release_tag }}"
+          git push
